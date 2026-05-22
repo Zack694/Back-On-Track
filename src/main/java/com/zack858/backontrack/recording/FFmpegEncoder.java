@@ -36,14 +36,18 @@ import java.util.concurrent.atomic.AtomicLong;
  * the recording plays back at real speed instead of being sped up when our
  * capture lags.
  *
+ * <h2>Encoder selection</h2>
+ * When {@link ModConfig#videoCodec} is {@code "auto"} (the default), we ask
+ * {@link EncoderProbe} which H.264 encoders this FFmpeg build supports and
+ * pick the fastest one available -- {@code h264_mediacodec} on Android,
+ * {@code h264_nvenc}/{@code _amf}/{@code _qsv}/{@code _videotoolbox} on
+ * desktops with the matching GPU, falling back to {@code libx264}.
+ *
  * <h2>Memory</h2>
  * Frame byte[]s are recycled through {@link #acquireBuffer()} /
  * {@link #releaseBuffer(byte[])} so we don't churn 8 MB+ per frame at 1080p60.
  *
- * Works with any FFmpeg build that supports the configured encoder
- * (libx264 by default; libx265, h264_nvenc, hevc_nvenc, h264_amf, hevc_amf,
- * h264_qsv, h264_videotoolbox are all wired up). FFmpeg must be present
- * either on PATH or at {@link ModConfig#ffmpegPath}.
+ * FFmpeg must be present either on PATH or at {@link ModConfig#ffmpegPath}.
  */
 public final class FFmpegEncoder {
     /** Bounded queue: prevents unbounded memory growth if FFmpeg can't keep up. */
@@ -59,6 +63,8 @@ public final class FFmpegEncoder {
     private final int frameByteSize;
     private final Path outputFile;
 
+    /** Concrete encoder we're actually using (resolved from {@code cfg.videoCodec}). */
+    private String resolvedCodec;
     private Process process;
     private Thread writerThread;
     private Thread stderrThread;
@@ -86,6 +92,15 @@ public final class FFmpegEncoder {
      */
     public void start() throws IOException {
         Files.createDirectories(outputFile.getParent());
+
+        // Resolve "auto" -> concrete encoder. May trigger an `ffmpeg -encoders`
+        // probe on first call (cached afterwards). We do this here, not in the
+        // constructor, so the (possibly slow) probe runs on the start path
+        // rather than during render-thread setup.
+        this.resolvedCodec = EncoderProbe.resolve(cfg.videoCodec, cfg.ffmpegPath);
+        BackOnTrack.LOGGER.info(
+                "Encoder: requested='{}' resolved='{}' size={}x{} @ {}fps",
+                cfg.videoCodec, resolvedCodec, srcWidth, srcHeight, cfg.fps);
 
         ProcessBuilder pb = new ProcessBuilder(buildCommand())
                 .redirectErrorStream(false);
@@ -195,6 +210,7 @@ public final class FFmpegEncoder {
     public Path getOutputFile() { return outputFile; }
     public long getFrameCount() { return frameCount.get(); }
     public long getDroppedFrames() { return droppedFrames.get(); }
+    public String getResolvedCodec() { return resolvedCodec; }
 
     // ---- internals ----
 
@@ -269,7 +285,7 @@ public final class FFmpegEncoder {
         cmd.add("-vsync"); cmd.add("cfr");
 
         // ---- Encoder-specific args ----
-        cmd.add("-c:v"); cmd.add(cfg.videoCodec);
+        cmd.add("-c:v"); cmd.add(resolvedCodec);
         applyEncoderArgs(cmd);
 
         cmd.add("-pix_fmt"); cmd.add("yuv420p");
@@ -284,22 +300,48 @@ public final class FFmpegEncoder {
      * Each branch sets sensible rate-control + preset for that backend.
      */
     private void applyEncoderArgs(List<String> cmd) {
-        String codec = cfg.videoCodec.toLowerCase(Locale.ROOT);
+        String codec = resolvedCodec.toLowerCase(Locale.ROOT);
         int bitrate = cfg.bitrateKbps;
+
         if (codec.equals("libx264") || codec.equals("libx265")) {
             // CPU x264/x265: zerolatency disables b-frames + lookahead, which
             // is exactly what a real-time recorder wants.
             cmd.add("-preset"); cmd.add(cfg.preset);
             cmd.add("-tune"); cmd.add("zerolatency");
+            // Cap encoder threads so we leave cores for the game itself.
+            // Replay Mod uses processors-2; we follow the same rule.
+            cmd.add("-threads");
+            cmd.add(String.valueOf(PlatformDetect.recommendedEncoderThreads()));
+            if (cfg.useCrf) {
+                // CRF mode: predictable visual quality regardless of motion,
+                // with a hard ceiling so a busy scene can't blow up the file.
+                cmd.add("-crf"); cmd.add(String.valueOf(cfg.crf));
+                cmd.add("-maxrate"); cmd.add(bitrate + "k");
+                cmd.add("-bufsize"); cmd.add((bitrate * 2) + "k");
+            } else {
+                cmd.add("-b:v"); cmd.add(bitrate + "k");
+                cmd.add("-maxrate"); cmd.add(bitrate + "k");
+                cmd.add("-bufsize"); cmd.add((bitrate * 2) + "k");
+            }
+        } else if (codec.equals("h264_mediacodec") || codec.equals("hevc_mediacodec")) {
+            // Android hardware encoder. This is the right pick on
+            // Zalith/PojavLauncher -- it offloads encoding to the SoC's
+            // dedicated H.264 block, leaving the CPU for the game.
+            // Bitrate-mode CBR is the most widely supported on Android
+            // SoC encoders; VBR exists but isn't universal.
+            cmd.add("-bitrate_mode"); cmd.add("cbr");
             cmd.add("-b:v"); cmd.add(bitrate + "k");
-            cmd.add("-maxrate"); cmd.add(bitrate + "k");
-            cmd.add("-bufsize"); cmd.add((bitrate * 2) + "k");
+            cmd.add("-profile:v"); cmd.add("high");
+            cmd.add("-level"); cmd.add("4.1");
+        } else if (codec.equals("h264_v4l2m2m") || codec.equals("hevc_v4l2m2m")) {
+            // ARM Linux v4l2 m2m (Pi etc). Few tunables.
+            cmd.add("-b:v"); cmd.add(bitrate + "k");
         } else if (codec.endsWith("_nvenc")) {
             // NVIDIA NVENC: p1 (fastest) -> p7 (best quality). p5 is balanced.
             cmd.add("-preset"); cmd.add("p5");
             cmd.add("-tune"); cmd.add("hq");
             cmd.add("-rc"); cmd.add("vbr");
-            cmd.add("-cq"); cmd.add("23");
+            cmd.add("-cq"); cmd.add(String.valueOf(cfg.crf));
             cmd.add("-b:v"); cmd.add(bitrate + "k");
             cmd.add("-maxrate"); cmd.add((bitrate * 2) + "k");
         } else if (codec.endsWith("_amf")) {
@@ -313,6 +355,10 @@ public final class FFmpegEncoder {
             cmd.add("-preset"); cmd.add("veryfast");
             cmd.add("-b:v"); cmd.add(bitrate + "k");
             cmd.add("-maxrate"); cmd.add((bitrate * 2) + "k");
+        } else if (codec.endsWith("_vaapi")) {
+            // Linux VA-API.
+            cmd.add("-rc_mode"); cmd.add("VBR");
+            cmd.add("-b:v"); cmd.add(bitrate + "k");
         } else if (codec.endsWith("_videotoolbox")) {
             // Apple VideoToolbox.
             cmd.add("-realtime"); cmd.add("1");
