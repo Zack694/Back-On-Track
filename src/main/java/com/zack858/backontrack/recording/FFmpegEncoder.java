@@ -65,6 +65,8 @@ public final class FFmpegEncoder {
 
     /** Concrete encoder we're actually using (resolved from {@code cfg.videoCodec}). */
     private String resolvedCodec;
+    /** Resolved path to the FFmpeg binary (Pojav plugin path on Android, "ffmpeg" elsewhere). */
+    private String resolvedFFmpegPath;
     private Process process;
     private Thread writerThread;
     private Thread stderrThread;
@@ -93,14 +95,20 @@ public final class FFmpegEncoder {
     public void start() throws IOException {
         Files.createDirectories(outputFile.getParent());
 
+        // Resolve where ffmpeg actually lives. On Android this finds the
+        // Pojav FFmpeg Plugin's installed binary; on desktop it falls
+        // through to the configured path / system PATH.
+        this.resolvedFFmpegPath = FFmpegLocator.resolve(cfg.ffmpegPath);
+
         // Resolve "auto" -> concrete encoder. May trigger an `ffmpeg -encoders`
         // probe on first call (cached afterwards). We do this here, not in the
         // constructor, so the (possibly slow) probe runs on the start path
         // rather than during render-thread setup.
-        this.resolvedCodec = EncoderProbe.resolve(cfg.videoCodec, cfg.ffmpegPath);
+        this.resolvedCodec = EncoderProbe.resolve(cfg.videoCodec, resolvedFFmpegPath);
         BackOnTrack.LOGGER.info(
-                "Encoder: requested='{}' resolved='{}' size={}x{} @ {}fps",
-                cfg.videoCodec, resolvedCodec, srcWidth, srcHeight, cfg.fps);
+                "Encoder: requested='{}' resolved='{}' size={}x{} @ {}fps (ffmpeg via {})",
+                cfg.videoCodec, resolvedCodec, srcWidth, srcHeight, cfg.fps,
+                FFmpegLocator.resolutionSource());
 
         ProcessBuilder pb = new ProcessBuilder(buildCommand())
                 .redirectErrorStream(false);
@@ -254,7 +262,7 @@ public final class FFmpegEncoder {
 
     private List<String> buildCommand() {
         List<String> cmd = new ArrayList<>();
-        cmd.add(cfg.ffmpegPath);
+        cmd.add(resolvedFFmpegPath != null ? resolvedFFmpegPath : cfg.ffmpegPath);
         cmd.add("-y"); // overwrite output if exists (we use timestamped names anyway)
         cmd.add("-hide_banner");
         cmd.add("-loglevel"); cmd.add("warning");
