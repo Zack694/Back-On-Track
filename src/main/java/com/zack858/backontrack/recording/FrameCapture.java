@@ -53,7 +53,10 @@ public final class FrameCapture {
             // sequence FFmpeg expects.
             int[] argbPixels = image.copyPixelsAbgr();
 
-            byte[] rgba = new byte[w * h * 4];
+            // Acquire a pooled byte[] from the encoder when dimensions match
+            // the active recording; falls back to a fresh array on resize
+            // (which RecordingManager will detect and stop on).
+            byte[] rgba = manager.acquireFrameBuffer(w, h);
             ByteBuffer bb = ByteBuffer.wrap(rgba).order(ByteOrder.LITTLE_ENDIAN);
             IntBuffer ib = bb.asIntBuffer();
             ib.put(argbPixels);

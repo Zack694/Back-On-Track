@@ -28,9 +28,31 @@ public final class ModConfig {
     public int height = 720;
     public int fps = 60;
     public int bitrateKbps = 8000;
-    /** ffmpeg encoder name (libx264, libx265, h264_nvenc, hevc_nvenc, h264_qsv...). */
+    /**
+     * FFmpeg encoder name. Pick the one that matches your hardware:
+     * <ul>
+     *   <li>{@code libx264} - CPU H.264 (default; works everywhere)</li>
+     *   <li>{@code libx265} - CPU H.265 (high quality, very slow; offline-ish)</li>
+     *   <li>{@code h264_nvenc} / {@code hevc_nvenc} - NVIDIA GPU (recommended for NVIDIA users)</li>
+     *   <li>{@code h264_amf} / {@code hevc_amf} - AMD GPU</li>
+     *   <li>{@code h264_qsv} - Intel QuickSync</li>
+     *   <li>{@code h264_videotoolbox} - macOS</li>
+     * </ul>
+     * Hardware encoders move work off the CPU and dramatically reduce the
+     * in-game performance impact of recording.
+     */
     public String videoCodec = "libx264";
-    /** ffmpeg preset (ultrafast, superfast, veryfast, faster, fast, medium, slow). */
+    /**
+     * Encoder preset. Meaning depends on the encoder:
+     * <ul>
+     *   <li>libx264/libx265: {@code ultrafast, superfast, veryfast, faster, fast, medium, slow}.
+     *       For real-time recording use {@code veryfast} or {@code ultrafast}.</li>
+     *   <li>h264_nvenc / hevc_nvenc: ignored - NVENC tuning is handled
+     *       internally with preset {@code p5} + tune {@code hq} (balanced).</li>
+     *   <li>Other hardware encoders: ignored - encoder-specific defaults
+     *       are applied in {@link com.zack858.backontrack.recording.FFmpegEncoder}.</li>
+     * </ul>
+     */
     public String preset = "veryfast";
     /** Output container: mp4, mkv, mov. */
     public String container = "mp4";

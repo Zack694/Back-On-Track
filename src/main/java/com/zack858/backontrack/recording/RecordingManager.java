@@ -186,6 +186,19 @@ public final class RecordingManager {
         encoder.submitFrame(rgba);
     }
 
+    /**
+     * Acquire a pooled frame buffer matching the active recording, or a fresh
+     * byte[] if dimensions don't match the encoder's source size (the resize
+     * path; the buffer will be discarded after the stop call below).
+     */
+    public byte[] acquireFrameBuffer(int width, int height) {
+        FFmpegEncoder enc = this.encoder;
+        if (enc == null || width != srcWidth || height != srcHeight) {
+            return new byte[width * height * 4];
+        }
+        return enc.acquireBuffer();
+    }
+
     public int getSrcWidth() { return srcWidth; }
     public int getSrcHeight() { return srcHeight; }
 
