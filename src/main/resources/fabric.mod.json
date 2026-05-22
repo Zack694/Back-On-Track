@@ -1,0 +1,48 @@
+{
+  "schemaVersion": 1,
+  "id": "back_on_track",
+  "version": "${version}",
+  "name": "Back On Track",
+  "description": "A lightweight raw gameplay recorder for Minecraft. Captures video (including GUI) directly to MP4 via FFmpeg. Inspired by Flashback and Replay Mod, without the editing overhead.",
+  "authors": [
+    "Zack858"
+  ],
+  "contact": {
+    "homepage": "https://github.com/Zack694/Back-On-Track",
+    "sources": "https://github.com/Zack694/Back-On-Track",
+    "issues": "https://github.com/Zack694/Back-On-Track/issues"
+  },
+  "license": "MIT",
+  "icon": "assets/back_on_track/icon.png",
+  "environment": "client",
+  "entrypoints": {
+    "main": [
+      "com.zack858.backontrack.BackOnTrack"
+    ],
+    "client": [
+      "com.zack858.backontrack.BackOnTrackClient"
+    ],
+    "voicechat": [
+      "com.zack858.backontrack.audio.BackOnTrackVoicechatPlugin"
+    ]
+  },
+  "mixins": [
+    "back_on_track.mixins.json"
+  ],
+  "depends": {
+    "fabricloader": ">=${loader_version}",
+    "minecraft": "~${minecraft_version}",
+    "java": ">=21",
+    "fabric-api": "*"
+  },
+  "suggests": {
+    "voicechat": ">=2.5.0"
+  },
+  "custom": {
+    "modmenu": {
+      "links": {
+        "modmenu.discord": "https://github.com/Zack694/Back-On-Track"
+      }
+    }
+  }
+}
