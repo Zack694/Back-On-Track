@@ -30,6 +30,9 @@ public final class RecordingManager {
 
     private final AtomicReference<RecordingState> state =
             new AtomicReference<>(RecordingState.IDLE);
+    /** Debounce so the encoder-died auto-stop only fires once per recording. */
+    private final java.util.concurrent.atomic.AtomicBoolean encoderDeathReported =
+            new java.util.concurrent.atomic.AtomicBoolean(false);
 
     private FFmpegEncoder encoder;
     private AudioCapture audioCapture;
@@ -84,6 +87,7 @@ public final class RecordingManager {
             captureIntervalNanos = TimeUnit.SECONDS.toNanos(1) / Math.max(1, cfg.fps);
             startNanos = System.nanoTime();
             lastCaptureNanos = 0L; // first frame triggers immediately
+            encoderDeathReported.set(false);
 
             toast(client, Text.translatable("back_on_track.toast.start.title"),
                     Text.translatable("back_on_track.toast.start.body"));
@@ -165,6 +169,24 @@ public final class RecordingManager {
      */
     public boolean shouldCaptureNow() {
         if (!isRecording()) return false;
+        // Encoder crashed mid-recording? Stop with an error toast instead of
+        // silently dropping every frame for the rest of the session.
+        FFmpegEncoder enc = this.encoder;
+        if (enc != null && enc.hasDied()
+                && encoderDeathReported.compareAndSet(false, true)) {
+            BackOnTrack.LOGGER.warn("FFmpeg encoder died mid-recording; stopping with error toast.");
+            MinecraftClient mc = MinecraftClient.getInstance();
+            if (mc != null) {
+                mc.execute(() -> {
+                    stop(mc);
+                    toast(mc,
+                            Text.translatable("back_on_track.toast.error.title"),
+                            Text.translatable("back_on_track.toast.error.generic",
+                                    "FFmpeg encoder crashed mid-recording. Check the log."));
+                });
+            }
+            return false;
+        }
         long now = System.nanoTime();
         if (now - lastCaptureNanos < captureIntervalNanos) return false;
         lastCaptureNanos = now;

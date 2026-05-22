@@ -3,123 +3,125 @@ package com.zack858.backontrack.recording;
 import com.zack858.backontrack.BackOnTrack;
 
 import java.io.File;
-import java.util.Locale;
 
 /**
- * Resolves where the FFmpeg binary lives on this device. Most of the
- * complexity is for Android where the binary is delivered as an APK plugin
- * (the Pojav FFmpeg Plugin, package {@code net.kdt.pojavlaunch.ffmpeg}).
+ * Resolves where the FFmpeg binary lives on this device, with special
+ * handling for Android's Pojav FFmpeg Plugin.
  *
- * <h2>Lookup order</h2>
+ * <h2>Why this is non-trivial on Android</h2>
+ * The plugin ships ffmpeg as {@code libffmpeg.so} inside an APK at
+ * {@code /data/data/net.kdt.pojavlaunch.ffmpeg/lib/<abi>/}. Pojav-derived
+ * launchers install a JNI exec hook that rewrites any
+ * {@link ProcessBuilder} call where the program basename is literally
+ * {@code "ffmpeg"} -- the hook substitutes the plugin path <em>and</em>
+ * configures {@code LD_LIBRARY_PATH} so the plugin's bundled {@code .so}
+ * dependencies (libavcodec, libx264, libssl, etc.) resolve correctly.
+ *
+ * <p><b>Critical:</b> if we pre-resolve to the absolute plugin path and
+ * pass that to ProcessBuilder, the hook does <em>not</em> fire, no
+ * {@code LD_LIBRARY_PATH} gets set, and ffmpeg crashes the moment it tries
+ * to load any of its bundled deps. So we must keep the program name as
+ * {@code "ffmpeg"} whenever the hook is available.</p>
+ *
+ * <h2>Resolution chain</h2>
  * <ol>
- *   <li><b>User config override</b> -- if the configured path is anything
- *       other than the literal string {@code "ffmpeg"}, trust it.</li>
- *   <li><b>{@code POJAV_FFMPEG_PATH} env var</b> -- set by PojavLauncher /
- *       Zalith on JVM startup. Always points at the plugin's executable.</li>
- *   <li><b>Plugin install paths</b> -- direct probe of
- *       {@code /data/data/net.kdt.pojavlaunch.ffmpeg/lib/<arch>/libffmpeg.so}
- *       across all four Android ABIs. Lets the mod work even if the JNI exec
- *       hook isn't installed (e.g. headless JVM, future launcher changes).</li>
- *   <li><b>Falls through to {@code "ffmpeg"}</b> -- relies on PATH on desktop;
- *       on Pojav-derived launchers the JNI hook will rewrite it transparently.</li>
+ *   <li><b>User override</b> -- explicit non-default path is trusted.</li>
+ *   <li><b>{@code POJAV_FFMPEG_PATH} env var present</b> -- the JNI hook is
+ *       wired up. Return the literal {@code "ffmpeg"} so the hook can do
+ *       its work.</li>
+ *   <li><b>Plugin installed but no hook</b> -- return the absolute path,
+ *       and a {@link Resolution#ldLibraryPath} for the caller to splice
+ *       into the child process environment.</li>
+ *   <li><b>Default</b> -- {@code "ffmpeg"} via PATH.</li>
  * </ol>
- *
- * <p>Result is cached for the JVM lifetime; call {@link #reset()} to re-probe.</p>
  */
 public final class FFmpegLocator {
-    /** Pojav's plugin package, never changes. */
     private static final String POJAV_FFMPEG_PACKAGE = "net.kdt.pojavlaunch.ffmpeg";
-    /** Env var Pojav sets to the resolved plugin executable. */
     private static final String POJAV_ENV = "POJAV_FFMPEG_PATH";
-    /** Filename Android requires for executable .so libs. */
     private static final String LIB_NAME = "libffmpeg.so";
 
-    private static volatile String cachedResolved;
-    private static volatile String cachedSource;
+    private static volatile Resolution cached;
 
     private FFmpegLocator() {}
 
     /**
-     * Resolve {@code configured} into an actual executable path. Returns the
-     * configured value as-is if it's not the default string {@code "ffmpeg"};
-     * otherwise walks the lookup chain above.
+     * Result of {@link #resolve(String)}. {@link #exec} is what to pass to
+     * {@link ProcessBuilder}; {@link #ldLibraryPath} is non-null only when
+     * the caller must splice it into the child env (the no-JNI-hook path).
      */
-    public static String resolve(String configured) {
-        // Per-JVM cache: re-doing the filesystem probe on every record start
-        // would be wasteful.
-        String cached = cachedResolved;
-        if (cached != null && (configured == null
-                || configured.equalsIgnoreCase("ffmpeg"))) {
-            return cached;
+    public static final class Resolution {
+        public final String exec;
+        public final String ldLibraryPath;
+        public final String source;
+
+        Resolution(String exec, String ldLibraryPath, String source) {
+            this.exec = exec;
+            this.ldLibraryPath = ldLibraryPath;
+            this.source = source;
         }
+    }
+
+    public static Resolution resolve(String configured) {
+        Resolution c = cached;
+        boolean defaultRequested = configured == null
+                || configured.isBlank()
+                || configured.equalsIgnoreCase("ffmpeg");
+        if (c != null && defaultRequested) return c;
 
         // 1) User override -- any explicit path wins.
-        if (configured != null && !configured.isBlank()
-                && !configured.equalsIgnoreCase("ffmpeg")) {
-            log("config", configured);
-            return configured;
+        if (!defaultRequested) {
+            Resolution r = new Resolution(configured, null, "config");
+            BackOnTrack.LOGGER.info("FFmpeg [{}]: {}", r.source, r.exec);
+            return r;
         }
 
-        // 2) Pojav env var -- canonical on Pojav/Zalith.
+        // 2) Pojav JNI hook is wired up (env var is the smoking gun).
+        // Use the literal "ffmpeg" so the hook fires and sets
+        // LD_LIBRARY_PATH for the plugin's bundled deps.
         String env = System.getenv(POJAV_ENV);
         if (env != null && !env.isBlank() && new File(env).exists()) {
-            return cache("env:" + POJAV_ENV, env);
+            return cache(new Resolution("ffmpeg", null, "pojav-hook"),
+                    "Pojav JNI hook detected (POJAV_FFMPEG_PATH=" + env + ")");
         }
 
-        // 3) Plugin install dir, probed for whichever ABI the JVM picked.
+        // 3) Plugin installed but no hook -- invoke directly + set LD path.
         if (PlatformDetect.isAndroid()) {
-            String fromPlugin = probePluginInstallDir();
-            if (fromPlugin != null) {
-                return cache("pojav-plugin", fromPlugin);
+            String absPath = probePluginInstallDir();
+            if (absPath != null) {
+                String libDir = new File(absPath).getParent();
+                return cache(new Resolution(absPath, libDir, "pojav-plugin-direct"),
+                        "Pojav FFmpeg Plugin found; LD_LIBRARY_PATH=" + libDir);
             }
             BackOnTrack.LOGGER.warn(
                     "Running on Android but no FFmpeg found. Install the Pojav " +
                     "FFmpeg Plugin: https://github.com/PojavLauncherTeam/FFmpegPlugin");
         }
 
-        // 4) Trust the JNI hook (Pojav) or PATH (desktop).
-        return cache("default", "ffmpeg");
+        // 4) Default: trust PATH.
+        return cache(new Resolution("ffmpeg", null, "default"),
+                "using 'ffmpeg' from PATH");
     }
 
-    /** Forget the cached resolution so the next call probes again. */
-    public static synchronized void reset() {
-        cachedResolved = null;
-        cachedSource = null;
-    }
+    public static synchronized void reset() { cached = null; }
 
-    /** For diagnostics: which lookup tier produced the cached result. */
     public static String resolutionSource() {
-        return cachedSource != null ? cachedSource : "uncached";
+        Resolution c = cached;
+        return c != null ? c.source : "uncached";
     }
 
-    // ---- internals ----
-
-    /**
-     * Look at every ABI directory under the plugin's install path and return
-     * the first one that actually contains the executable. Android namespaces
-     * native libs by ABI, so the right path is e.g.
-     * {@code /data/data/net.kdt.pojavlaunch.ffmpeg/lib/arm64-v8a/libffmpeg.so}.
-     */
     private static String probePluginInstallDir() {
-        // /data/data/<pkg> is the canonical install root on Android. Some
-        // launchers run under /data/user/0/<pkg> (multi-user); we try both.
         String[] dataRoots = {
                 "/data/data/" + POJAV_FFMPEG_PACKAGE + "/lib",
                 "/data/user/0/" + POJAV_FFMPEG_PACKAGE + "/lib"
         };
-        // ABI ordering matches the order Android prefers on a 64-bit device,
-        // so we hit the right one first on most modern phones.
         String[] abis = { "arm64-v8a", "armeabi-v7a", "x86_64", "x86" };
         for (String root : dataRoots) {
             for (String abi : abis) {
                 File f = new File(root + "/" + abi, LIB_NAME);
-                if (f.exists() && f.canExecute()) {
-                    return f.getAbsolutePath();
-                }
+                if (f.exists() && f.canExecute()) return f.getAbsolutePath();
             }
         }
-        // Last-ditch: scan whatever's actually there in case the ABI naming
-        // scheme drifts in a future release.
+        // Last-ditch: scan whatever's there in case ABI naming drifts.
         for (String root : dataRoots) {
             File rootDir = new File(root);
             File[] children = rootDir.listFiles();
@@ -132,17 +134,9 @@ public final class FFmpegLocator {
         return null;
     }
 
-    private static synchronized String cache(String source, String path) {
-        cachedResolved = path;
-        cachedSource = source;
-        log(source, path);
-        return path;
-    }
-
-    private static void log(String source, String path) {
-        BackOnTrack.LOGGER.info("FFmpeg resolved via [{}]: {}",
-                source, path.toLowerCase(Locale.ROOT).contains(LIB_NAME)
-                        ? path + " (Pojav FFmpeg Plugin)"
-                        : path);
+    private static synchronized Resolution cache(Resolution r, String detail) {
+        cached = r;
+        BackOnTrack.LOGGER.info("FFmpeg [{}]: {} ({})", r.source, r.exec, detail);
+        return r;
     }
 }

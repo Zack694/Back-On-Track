@@ -15,6 +15,7 @@ import java.time.format.DateTimeFormatter;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Locale;
+import java.util.Map;
 import java.util.concurrent.ArrayBlockingQueue;
 import java.util.concurrent.BlockingQueue;
 import java.util.concurrent.ConcurrentLinkedDeque;
@@ -65,8 +66,8 @@ public final class FFmpegEncoder {
 
     /** Concrete encoder we're actually using (resolved from {@code cfg.videoCodec}). */
     private String resolvedCodec;
-    /** Resolved path to the FFmpeg binary (Pojav plugin path on Android, "ffmpeg" elsewhere). */
-    private String resolvedFFmpegPath;
+    /** How to invoke ffmpeg + any LD_LIBRARY_PATH the child env needs. */
+    private FFmpegLocator.Resolution resolvedExec;
     private Process process;
     private Thread writerThread;
     private Thread stderrThread;
@@ -77,6 +78,12 @@ public final class FFmpegEncoder {
      */
     private final ConcurrentLinkedDeque<byte[]> bufferPool = new ConcurrentLinkedDeque<>();
     private final AtomicBoolean running = new AtomicBoolean(false);
+    /**
+     * Flips true when the writer thread sees a broken pipe (typical sign of
+     * FFmpeg crashing). Read by {@link RecordingManager} so it can auto-stop
+     * with an error toast instead of silently dropping frames forever.
+     */
+    private final AtomicBoolean encoderDied = new AtomicBoolean(false);
     private final AtomicLong frameCount = new AtomicLong(0);
     private final AtomicLong droppedFrames = new AtomicLong(0);
 
@@ -95,26 +102,28 @@ public final class FFmpegEncoder {
     public void start() throws IOException {
         Files.createDirectories(outputFile.getParent());
 
-        // Resolve where ffmpeg actually lives. On Android this finds the
-        // Pojav FFmpeg Plugin's installed binary; on desktop it falls
-        // through to the configured path / system PATH.
-        this.resolvedFFmpegPath = FFmpegLocator.resolve(cfg.ffmpegPath);
+        // Resolve where ffmpeg actually lives. On Pojav this returns the
+        // literal "ffmpeg" so the JNI exec hook fires (which also sets
+        // LD_LIBRARY_PATH for the plugin's bundled deps). Bypassing the
+        // hook by passing an absolute path causes ffmpeg to crash mid-encode
+        // when libx264 lazy-loads a dependency.
+        this.resolvedExec = FFmpegLocator.resolve(cfg.ffmpegPath);
 
-        // Resolve "auto" -> concrete encoder. May trigger an `ffmpeg -encoders`
-        // probe on first call (cached afterwards). We do this here, not in the
-        // constructor, so the (possibly slow) probe runs on the start path
-        // rather than during render-thread setup.
-        this.resolvedCodec = EncoderProbe.resolve(cfg.videoCodec, resolvedFFmpegPath);
+        // "auto" -> concrete encoder. The probe runs ffmpeg as a subprocess
+        // too, so it needs the same Resolution so it can apply LD_LIBRARY_PATH
+        // when we're on the no-hook plugin path.
+        this.resolvedCodec = EncoderProbe.resolve(cfg.videoCodec, resolvedExec);
         BackOnTrack.LOGGER.info(
                 "Encoder: requested='{}' resolved='{}' size={}x{} @ {}fps (ffmpeg via {})",
                 cfg.videoCodec, resolvedCodec, srcWidth, srcHeight, cfg.fps,
-                FFmpegLocator.resolutionSource());
+                resolvedExec.source);
 
         ProcessBuilder pb = new ProcessBuilder(buildCommand())
                 .redirectErrorStream(false);
-        // Inherit env; we don't want to override anything.
+        applyChildEnv(pb);
         process = pb.start();
         running.set(true);
+        encoderDied.set(false);
 
         // Drain stderr so FFmpeg never blocks on full stderr buffer, and so we
         // capture useful diagnostic logs.
@@ -159,7 +168,10 @@ public final class FFmpegEncoder {
      * buffers are recycled back into the pool.
      */
     public void submitFrame(byte[] rgbaFrame) {
-        if (!running.get()) {
+        if (!running.get() || encoderDied.get()) {
+            // If the encoder died, frames go straight back to the pool.
+            // RecordingManager will spot encoderDied on the next render frame
+            // and trigger the stop path.
             releaseBuffer(rgbaFrame);
             return;
         }
@@ -179,10 +191,21 @@ public final class FFmpegEncoder {
         if (!running.compareAndSet(true, false)) {
             return outputFile;
         }
+
+        // offer-with-timeout instead of put(): if the writer thread is dead
+        // and the queue is full, put() would block forever. The writer's
+        // finally block normally drains the queue, but we belt-and-brace
+        // with a timeout in case it's stuck somewhere else (e.g. mid-write).
+        boolean queued = false;
         try {
-            queue.put(POISON);
+            queued = queue.offer(POISON, 5, TimeUnit.SECONDS);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        }
+        if (!queued) {
+            BackOnTrack.LOGGER.warn(
+                    "Could not signal encoder writer (queue full / writer stuck); force-killing FFmpeg.");
+            if (process != null) process.destroyForcibly();
         }
 
         // Wait for writer to drain.
@@ -210,8 +233,9 @@ public final class FFmpegEncoder {
 
         bufferPool.clear();
 
-        BackOnTrack.LOGGER.info("FFmpeg finished. Frames: {}, dropped: {}, file: {}",
-                frameCount.get(), droppedFrames.get(), outputFile);
+        BackOnTrack.LOGGER.info(
+                "FFmpeg finished. Frames: {}, dropped: {}, died: {}, file: {}",
+                frameCount.get(), droppedFrames.get(), encoderDied.get(), outputFile);
         return outputFile;
     }
 
@@ -219,6 +243,25 @@ public final class FFmpegEncoder {
     public long getFrameCount() { return frameCount.get(); }
     public long getDroppedFrames() { return droppedFrames.get(); }
     public String getResolvedCodec() { return resolvedCodec; }
+    /** True when FFmpeg crashed mid-recording (broken pipe on writer thread). */
+    public boolean hasDied() { return encoderDied.get(); }
+
+    /**
+     * Splice {@code LD_LIBRARY_PATH} into the child environment when we
+     * resolved to the Pojav plugin's absolute path without the JNI hook.
+     * Without this, ffmpeg can't find its bundled libavcodec/libx264/etc.
+     * and crashes during encoder init.
+     */
+    private void applyChildEnv(ProcessBuilder pb) {
+        if (resolvedExec == null || resolvedExec.ldLibraryPath == null) return;
+        Map<String, String> env = pb.environment();
+        String existing = env.get("LD_LIBRARY_PATH");
+        String value = existing != null && !existing.isEmpty()
+                ? resolvedExec.ldLibraryPath + ":" + existing
+                : resolvedExec.ldLibraryPath;
+        env.put("LD_LIBRARY_PATH", value);
+        BackOnTrack.LOGGER.info("Set LD_LIBRARY_PATH={} for FFmpeg subprocess", value);
+    }
 
     // ---- internals ----
 
@@ -232,10 +275,21 @@ public final class FFmpegEncoder {
             }
             out.flush();
         } catch (IOException e) {
-            // Broken pipe usually means ffmpeg crashed; logged in stderr drainer.
-            BackOnTrack.LOGGER.warn("Writer thread terminated: {}", e.getMessage());
+            // Broken pipe = FFmpeg crashed (most common cause: missing
+            // dependency or invalid args caught during encoder init).
+            // The drainStderr thread typically logs the actual cause first.
+            BackOnTrack.LOGGER.warn("FFmpeg writer terminated (encoder may have crashed): {}",
+                    e.getMessage());
+            encoderDied.set(true);
         } catch (InterruptedException e) {
             Thread.currentThread().interrupt();
+        } finally {
+            // Drain any in-flight frames so submitFrame()/stop() can't block
+            // on a full queue once we're gone. Recycle them to the pool.
+            byte[] f;
+            while ((f = queue.poll()) != null) {
+                if (f != POISON) releaseBuffer(f);
+            }
         }
     }
 
@@ -262,7 +316,7 @@ public final class FFmpegEncoder {
 
     private List<String> buildCommand() {
         List<String> cmd = new ArrayList<>();
-        cmd.add(resolvedFFmpegPath != null ? resolvedFFmpegPath : cfg.ffmpegPath);
+        cmd.add(resolvedExec.exec);
         cmd.add("-y"); // overwrite output if exists (we use timestamped names anyway)
         cmd.add("-hide_banner");
         cmd.add("-loglevel"); cmd.add("warning");
